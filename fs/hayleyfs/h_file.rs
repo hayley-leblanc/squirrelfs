@@ -150,6 +150,8 @@ impl file::Operations for FileOps {
         _offset: i64,
         _len: i64,
     ) -> Result<u64> {
+        pr_info!("{:?}", _mode); 
+
         let inode: &mut fs::INode = unsafe { &mut *_file.inode().cast() };
         
         let sb = inode.i_sb();
@@ -164,28 +166,49 @@ impl file::Operations for FileOps {
         // Error checks beforehand
 
         if _mode == 0 {
-            if final_file_size > initial_size {
-                match hayleyfs_truncate(sbi, pi, final_file_size){
-                    Ok(_) => (),
-                    Err(_e) => {
-                        // do something here to return the right error code
-
-                        return Ok(1); // <-- change me.
-                    }
-                }    
-            } 
+            match hayleyfs_truncate(sbi, pi, final_file_size){
+                Ok(_) => pr_info!("OK"),
+                Err(e) => pr_info!("{:?}", e)
+            }    
         } 
-        
+
+        else if _mode & FALLOC_FLAG::FALLOC_FL_PUNCH_HOLE as i32 == 0x2 {
+            pr_info!("Punching a hole");
+
+            // offset of the page that _offset rounds up to
+            let upper_page_offset : u64 = page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE;
+            if final_file_size > initial_size {
+                // zero bytes when offset in the middle of the page
+                let len : u64 = upper_page_offset - (_offset as u64);
+
+                let pages = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, len, _offset as u64)?;
+                pr_info!("{:?} {:?}", len, _offset as i64); 
+
+                match pages {
+                    Ok(pages) => {
+                        pages.zero_pages(sbi, len, _offset as u64)?; 
+                    }
+                    Err(_) => pr_info!("Could not get pages to zero out")
+                }
+
+
+                match hayleyfs_truncate(sbi, pi, initial_size - upper_page_offset as i64){
+                    Ok(_) => pr_info!("OK"),
+                    Err(pages) => pr_info!("{:?}", pages)
+                }
+            }
+        }
+
         else if _mode & FALLOC_FLAG::FALLOC_FL_KEEP_SIZE as i32 == 1 {
+            pr_info!("Not Punching a hole");
+
             // truncate extends the flie size when the size is greater than the current size
             match hayleyfs_truncate(sbi, pi, final_file_size){
                 Ok(_) => pr_info!("OK"),
                 Err(e) => pr_info!("{:?}", e)
             }
+        }
             
-            // size will be restored at the end of this function.
-        } 
-        
         else if _mode & FALLOC_FLAG::FALLOC_FL_COLLAPSE_RANGE as i32 == 1 { //Charan, Lindsey
             
         }
@@ -195,9 +218,6 @@ impl file::Operations for FileOps {
         }
 
         else if _mode & FALLOC_FLAG::FALLOC_FL_INSERT_RANGE as i32 == 1 { //Kaustubh
-
-        }
-        else if _mode & FALLOC_FLAG::FALLOC_FL_PUNCH_HOLE as i32 == 1 { //Devon
 
         }
 
