@@ -160,7 +160,6 @@ impl file::Operations for FileOps {
         let final_file_size : i64 = _len + _offset;  
 
         let pi = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
-        // let pi_info = pi.get_inode_info()?;
         let initial_size: i64 = pi.get_size() as i64;
 
         // Error checks beforehand
@@ -174,28 +173,54 @@ impl file::Operations for FileOps {
 
         else if _mode & FALLOC_FLAG::FALLOC_FL_PUNCH_HOLE as i32 == 0x2 {
             pr_info!("Punching a hole");
+            let pi_to_unmap = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
 
-            // offset of the page that _offset rounds up to
-            let upper_page_offset : u64 = page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE;
+            
+            
             if final_file_size > initial_size {
-                // zero bytes when offset in the middle of the page
-                let len : u64 = upper_page_offset - (_offset as u64);
-
-                let pages = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, len, _offset as u64)?;
-                pr_info!("{:?} {:?}", len, _offset as i64); 
-
-                match pages {
-                    Ok(pages) => {
-                        pages.zero_pages(sbi, len, _offset as u64)?; 
+                // need to zero out from a non-aligned offset
+                if _offset as u64 != page_offset(_offset as u64)? {
+                    let bytes_to_zero : u64 = page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE - (_offset as u64);
+                    let pages_to_zero = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, bytes_to_zero, _offset as u64)?;
+                    match pages_to_zero {
+                        Ok(pages_to_zero) => {
+                            pages_to_zero.zero_pages(sbi, bytes_to_zero, _offset as u64)?; // moves page cursor
+                        }
+                        Err(_) => pr_info!("Error: Could not get page list")
                     }
-                    Err(_) => pr_info!("Could not get pages to zero out")
                 }
 
+                // offset of the page that _offset rounds up to 
+                // (upper_page_offset == _offset if already aligned)
+                // will not be rounded up if the file size is less than a page size
+                let offset_start_dealloc : u64 = if _offset as u64 == page_offset(_offset as u64)? || (initial_size as u64) < HAYLEYFS_PAGESIZE 
+                {_offset as u64} else {page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE};
 
-                match hayleyfs_truncate(sbi, pi, initial_size - upper_page_offset as i64){
-                    Ok(_) => pr_info!("OK"),
-                    Err(pages) => pr_info!("{:?}", pages)
+                // deallocate only if there is more than one page or we are deallocating the first and only page 
+                if (initial_size as u64) > HAYLEYFS_PAGESIZE || _offset == 0 {
+                    let (_, pi_to_unmap) = pi_to_unmap.dec_size(initial_size as u64); // get DecSize Pi for truncate list
+                    let pages_to_unmap = DataPageListWrapper::get_data_pages_to_truncate(&pi_to_unmap, offset_start_dealloc, 
+                        (initial_size as u64) - offset_start_dealloc)?; // needed to unmap pages
+    
+    
+                    let pi_info = pi_to_unmap.get_inode_info()?;
+    
+                    // then free the pages
+                    let pages_to_unmap = pages_to_unmap.unmap(sbi)?.fence();
+                    let pages_to_unmap = pages_to_unmap.dealloc(sbi)?.fence().mark_free();
+    
+                    sbi.page_allocator.dealloc_data_page_list(&pages_to_unmap)?;
+    
+                    // TODO: should this be done earlier or is it protected by locks?
+                    pi_info.remove_pages(&pages_to_unmap)?;
                 }
+            }
+            else if _offset as u64 != page_offset(_offset as u64)? && (page_offset(final_file_size as u64)? 
+                == (page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE)) {
+                // only zero out bits. No deallocation
+                pr_info!("Only Zero Out bits\n");
+
+
             }
         }
 
