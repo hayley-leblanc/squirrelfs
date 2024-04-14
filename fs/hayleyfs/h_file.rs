@@ -150,8 +150,6 @@ impl file::Operations for FileOps {
         _offset: i64,
         _len: i64,
     ) -> Result<u64> {
-        pr_info!("{:?}", _mode); 
-
         let inode: &mut fs::INode = unsafe { &mut *_file.inode().cast() };
         
         let sb = inode.i_sb();
@@ -173,18 +171,24 @@ impl file::Operations for FileOps {
 
         else if _mode & FALLOC_FLAG::FALLOC_FL_PUNCH_HOLE as i32 == 0x2 {
             pr_info!("Punching a hole");
-            let pi_to_unmap = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
 
-            
-            
+            if _offset > initial_size {
+                // cannot punch hole if offset is larger than size
+                return Ok(0); 
+            }
+
+            let p_offset : u64 = page_offset(_offset as u64)?; // the page offset of _offset
+            let end_hole : u64 = if final_file_size > initial_size {initial_size as u64} else {final_file_size as u64}; 
+
             if final_file_size > initial_size {
                 // need to zero out from a non-aligned offset
-                if _offset as u64 != page_offset(_offset as u64)? {
-                    let bytes_to_zero : u64 = page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE - (_offset as u64);
+                if _offset as u64 != p_offset {
+                    pr_info!("Zeroing out page"); 
+                    let bytes_to_zero : u64 = p_offset + HAYLEYFS_PAGESIZE - (_offset as u64);
                     let pages_to_zero = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, bytes_to_zero, _offset as u64)?;
                     match pages_to_zero {
                         Ok(pages_to_zero) => {
-                            pages_to_zero.zero_pages(sbi, bytes_to_zero, _offset as u64)?; // moves page cursor
+                            pages_to_zero.zero_pages(sbi, bytes_to_zero, _offset as u64)?; 
                         }
                         Err(_) => pr_info!("Error: Could not get page list")
                     }
@@ -193,14 +197,18 @@ impl file::Operations for FileOps {
                 // offset of the page that _offset rounds up to 
                 // (upper_page_offset == _offset if already aligned)
                 // will not be rounded up if the file size is less than a page size
-                let offset_start_dealloc : u64 = if _offset as u64 == page_offset(_offset as u64)? || (initial_size as u64) < HAYLEYFS_PAGESIZE 
-                {_offset as u64} else {page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE};
+                let offset_start_dealloc : u64 = if _offset as u64 == p_offset || end_hole < HAYLEYFS_PAGESIZE 
+                {_offset as u64} else {p_offset + HAYLEYFS_PAGESIZE};
 
                 // deallocate only if there is more than one page or we are deallocating the first and only page 
-                if (initial_size as u64) > HAYLEYFS_PAGESIZE || _offset == 0 {
+                if end_hole > HAYLEYFS_PAGESIZE || _offset == 0 {
+                    pr_info!("ZDeallocating whole page"); 
+
+                    let pi_to_unmap = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
+
                     let (_, pi_to_unmap) = pi_to_unmap.dec_size(initial_size as u64); // get DecSize Pi for truncate list
                     let pages_to_unmap = DataPageListWrapper::get_data_pages_to_truncate(&pi_to_unmap, offset_start_dealloc, 
-                        (initial_size as u64) - offset_start_dealloc)?; // needed to unmap pages
+                        (end_hole) - offset_start_dealloc)?; // needed to unmap pages
     
     
                     let pi_info = pi_to_unmap.get_inode_info()?;
@@ -215,18 +223,27 @@ impl file::Operations for FileOps {
                     pi_info.remove_pages(&pages_to_unmap)?;
                 }
             }
-            else if _offset as u64 != page_offset(_offset as u64)? && (page_offset(final_file_size as u64)? 
-                == (page_offset(_offset as u64)? + HAYLEYFS_PAGESIZE)) {
-                // only zero out bits. No deallocation
-                pr_info!("Only Zero Out bits\n");
 
+            else if (_offset as u64 != p_offset && (page_offset(end_hole)? == (p_offset + HAYLEYFS_PAGESIZE))) 
+                || (_offset as u64 == p_offset && (page_offset(end_hole)? == (p_offset))) {
+                pr_info!("Just Zeroing"); 
 
+                // only zero out bits because the hole does not deallocate from page_i to page_j start->end. No deallocation
+                // the first if-statement takes care of case when we have a file size less than PGSIZE long and we just zero-out bits
+
+                let bytes_to_zero = if final_file_size < initial_size {_len} else {initial_size - _offset}; 
+
+                let pages_to_zero = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, bytes_to_zero as u64, _offset as u64)?;
+                match pages_to_zero {
+                    Ok(pages_to_zero) => {
+                        pages_to_zero.zero_pages(sbi, bytes_to_zero as u64, _offset as u64)?; 
+                    }
+                    Err(_) => pr_info!("Error: Could not get page list")
+                }
             }
         }
 
         else if _mode & FALLOC_FLAG::FALLOC_FL_KEEP_SIZE as i32 == 1 {
-            pr_info!("Not Punching a hole");
-
             // truncate extends the flie size when the size is greater than the current size
             match hayleyfs_truncate(sbi, pi, final_file_size){
                 Ok(_) => pr_info!("OK"),
