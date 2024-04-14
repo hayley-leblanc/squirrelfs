@@ -551,15 +551,30 @@ fn hayleyfs_read(
         let result = pi_info.find(page_offset.try_into()?);
         end_timing!(LookupDataPage, page_lookup);
         if let Some(page_no) = result {
-            let data_page = DataPageWrapper::from_page_no(sbi, page_no)?;
-            init_timing!(read_page);
-            start_timing!(read_page);
-            let read = data_page.read_from_page(sbi, writer, offset_in_page, to_read)?;
-            end_timing!(ReadDataPage, read_page);
-            bytes_read += read;
-            offset += read;
-            count -= read;
-            bytes_left_in_file -= read;
+            match DataPageWrapper::from_page_no(sbi, page_no) {
+                Ok(data_page) => {
+                    // page has been allocated 
+                    init_timing!(read_page);
+                    start_timing!(read_page);
+                    let read = data_page.read_from_page(sbi, writer, offset_in_page, to_read)?;
+                    end_timing!(ReadDataPage, read_page);
+                    bytes_read += read;
+                    offset += read;
+                    count -= read;
+                    bytes_left_in_file -= read;
+                }
+                Err(_) => {
+                    // sparse file. output 0s. While loop guarentees we are within the size of inode
+                    init_timing!(read_page);
+                    start_timing!(read_page);
+                    writer.clear(to_read.try_into()?)?;
+                    end_timing!(ReadDataPage, read_page);
+                    bytes_read += to_read;
+                    offset += to_read;
+                    count -= to_read;
+                    bytes_left_in_file -= to_read;
+                }
+            }    
         } else {
             init_timing!(read_page);
             start_timing!(read_page);
