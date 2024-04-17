@@ -3,6 +3,7 @@ use crate::defs::*;
 use crate::h_inode::*;
 use crate::typestate::*;
 use crate::volatile::*;
+use crate::namei::*;
 use crate::{end_timing, fence_vec, init_timing, start_timing};
 use core::{ffi, marker::Sync, ptr, sync::atomic::Ordering};
 use kernel::prelude::*;
@@ -12,6 +13,7 @@ use kernel::{
     iomap, mm,
 };
 
+
 pub(crate) struct Adapter {}
 
 impl<T: Sync> file::OpenAdapter<T> for Adapter {
@@ -19,6 +21,20 @@ impl<T: Sync> file::OpenAdapter<T> for Adapter {
         ptr::null_mut()
     }
 }
+
+// FLags for fallocate modes 
+
+#[repr(i32)]
+#[allow(non_camel_case_types)]
+enum FALLOC_FLAG {
+    FALLOC_FL_KEEP_SIZE = 0x01,
+    FALLOC_FL_PUNCH_HOLE = 0x02,
+    // FALLOC_FL_NO_HIDE_STALE = 0x04,
+    FALLOC_FL_COLLAPSE_RANGE = 0x08,
+    FALLOC_FL_ZERO_RANGE = 0x10,
+    FALLOC_FL_INSERT_RANGE = 0x20,
+    // FALLOC_FL_UNSHARE_RANGE = 0x40,
+}   
 
 pub(crate) struct FileOps;
 #[vtable]
@@ -85,7 +101,7 @@ impl file::Operations for FileOps {
             Ok((bytes_written, _)) => Ok(bytes_written.try_into()?),
             Err(e) => Err(e),
         }
-    }
+    }   
 
     fn read(
         _data: (),
@@ -134,7 +150,125 @@ impl file::Operations for FileOps {
         _offset: i64,
         _len: i64,
     ) -> Result<u64> {
-        Err(EINVAL)
+        let inode: &mut fs::INode = unsafe { &mut *_file.inode().cast() };
+        
+        let sb = inode.i_sb();
+        let fs_info_raw = unsafe { (*sb).s_fs_info };
+        let sbi = unsafe { &mut *(fs_info_raw as *mut SbInfo) };
+        let final_file_size : i64 = _len + _offset;  
+
+        let pi = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
+        let initial_size: i64 = pi.get_size() as i64;
+
+        // Error checks beforehand
+
+        if _mode == 0 {
+            match hayleyfs_truncate(sbi, pi, final_file_size){
+                Ok(_) => pr_info!("OK"),
+                Err(e) => pr_info!("{:?}", e)
+            }    
+        } 
+
+        else if _mode & FALLOC_FLAG::FALLOC_FL_PUNCH_HOLE as i32 == 0x2 {
+            pr_info!("Punching a hole");
+
+            if _offset > initial_size {
+                // cannot punch hole if offset is larger than size
+                return Ok(0); 
+            }
+
+            let p_offset : u64 = page_offset(_offset as u64)?; // the page offset of _offset
+            let end_hole : u64 = if final_file_size > initial_size {initial_size as u64} else {final_file_size as u64}; 
+
+            if final_file_size > initial_size {
+                // need to zero out from a non-aligned offset
+                if _offset as u64 != p_offset {
+                    pr_info!("Zeroing out page"); 
+                    let bytes_to_zero : u64 = p_offset + HAYLEYFS_PAGESIZE - (_offset as u64);
+                    let pages_to_zero = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, bytes_to_zero, _offset as u64)?;
+                    match pages_to_zero {
+                        Ok(pages_to_zero) => {
+                            pages_to_zero.zero_pages(sbi, bytes_to_zero, _offset as u64)?; 
+                        }
+                        Err(_) => pr_info!("Error: Could not get page list")
+                    }
+                }
+
+                // offset of the page that _offset rounds up to 
+                // (upper_page_offset == _offset if already aligned)
+                // will not be rounded up if the file size is less than a page size
+                let offset_start_dealloc : u64 = if _offset as u64 == p_offset || end_hole < HAYLEYFS_PAGESIZE 
+                {_offset as u64} else {p_offset + HAYLEYFS_PAGESIZE};
+
+                // deallocate only if there is more than one page or we are deallocating the first and only page 
+                if end_hole > HAYLEYFS_PAGESIZE || _offset == 0 {
+                    pr_info!("ZDeallocating whole page"); 
+
+                    let pi_to_unmap = sbi.get_init_reg_inode_by_vfs_inode(inode.get_inner())?;
+
+                    let (_, pi_to_unmap) = pi_to_unmap.dec_size(initial_size as u64); // get DecSize Pi for truncate list
+                    let pages_to_unmap = DataPageListWrapper::get_data_pages_to_truncate(&pi_to_unmap, offset_start_dealloc, 
+                        (end_hole) - offset_start_dealloc)?; // needed to unmap pages
+    
+    
+                    let pi_info = pi_to_unmap.get_inode_info()?;
+    
+                    // then free the pages
+                    let pages_to_unmap = pages_to_unmap.unmap(sbi)?.fence();
+                    let pages_to_unmap = pages_to_unmap.dealloc(sbi)?.fence().mark_free();
+    
+                    sbi.page_allocator.dealloc_data_page_list(&pages_to_unmap)?;
+    
+                    // TODO: should this be done earlier or is it protected by locks?
+                    pi_info.remove_pages(&pages_to_unmap)?;
+                }
+            }
+
+            else if (_offset as u64 != p_offset && (page_offset(end_hole)? == (p_offset + HAYLEYFS_PAGESIZE))) 
+                || (_offset as u64 == p_offset && (page_offset(end_hole)? == (p_offset))) {
+                pr_info!("Just Zeroing"); 
+
+                // only zero out bits because the hole does not deallocate from page_i to page_j start->end. No deallocation
+                // the first if-statement takes care of case when we have a file size less than PGSIZE long and we just zero-out bits
+
+                let bytes_to_zero = if final_file_size < initial_size {_len} else {initial_size - _offset}; 
+
+                let pages_to_zero = DataPageListWrapper::get_data_page_list(pi.get_inode_info()?, bytes_to_zero as u64, _offset as u64)?;
+                match pages_to_zero {
+                    Ok(pages_to_zero) => {
+                        pages_to_zero.zero_pages(sbi, bytes_to_zero as u64, _offset as u64)?; 
+                    }
+                    Err(_) => pr_info!("Error: Could not get page list")
+                }
+            }
+        }
+
+        else if _mode & FALLOC_FLAG::FALLOC_FL_KEEP_SIZE as i32 == 1 {
+            // truncate extends the flie size when the size is greater than the current size
+            match hayleyfs_truncate(sbi, pi, final_file_size){
+                Ok(_) => pr_info!("OK"),
+                Err(e) => pr_info!("{:?}", e)
+            }
+        }
+            
+        else if _mode & FALLOC_FLAG::FALLOC_FL_COLLAPSE_RANGE as i32 == 1 { //Charan, Lindsey
+            
+        }
+
+        else if _mode & FALLOC_FLAG::FALLOC_FL_ZERO_RANGE as i32 == 1 { //Lindsey
+            
+        }
+
+        else if _mode & FALLOC_FLAG::FALLOC_FL_INSERT_RANGE as i32 == 1 { //Kaustubh
+
+        }
+
+        if _mode & FALLOC_FLAG::FALLOC_FL_KEEP_SIZE as i32 == 1 {
+            // reset file size to original <-- truncate will add zeroed out pages
+            inode.i_size_write(initial_size.try_into()?);
+        }
+
+        Ok(0)
     }
 
     fn ioctl(data: (), file: &file::File, cmd: &mut file::IoctlCommand) -> Result<i32> {
@@ -434,15 +568,30 @@ fn hayleyfs_read(
         let result = pi_info.find(page_offset.try_into()?);
         end_timing!(LookupDataPage, page_lookup);
         if let Some(page_no) = result {
-            let data_page = DataPageWrapper::from_page_no(sbi, page_no)?;
-            init_timing!(read_page);
-            start_timing!(read_page);
-            let read = data_page.read_from_page(sbi, writer, offset_in_page, to_read)?;
-            end_timing!(ReadDataPage, read_page);
-            bytes_read += read;
-            offset += read;
-            count -= read;
-            bytes_left_in_file -= read;
+            match DataPageWrapper::from_page_no(sbi, page_no) {
+                Ok(data_page) => {
+                    // page has been allocated 
+                    init_timing!(read_page);
+                    start_timing!(read_page);
+                    let read = data_page.read_from_page(sbi, writer, offset_in_page, to_read)?;
+                    end_timing!(ReadDataPage, read_page);
+                    bytes_read += read;
+                    offset += read;
+                    count -= read;
+                    bytes_left_in_file -= read;
+                }
+                Err(_) => {
+                    // sparse file. output 0s. While loop guarentees we are within the size of inode
+                    init_timing!(read_page);
+                    start_timing!(read_page);
+                    writer.clear(to_read.try_into()?)?;
+                    end_timing!(ReadDataPage, read_page);
+                    bytes_read += to_read;
+                    offset += to_read;
+                    count -= to_read;
+                    bytes_left_in_file -= to_read;
+                }
+            }    
         } else {
             init_timing!(read_page);
             start_timing!(read_page);
